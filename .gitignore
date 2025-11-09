@@ -1,3 +1,4 @@
 .idea
 .venv
 stock_sim.db
+"__pycache__/" 
