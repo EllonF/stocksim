@@ -1,5 +1,6 @@
 flask
+flask-cors
 apscheduler
 sqlalchemy
-datetime
+pyjwt
 gunicorn
