@@ -15,7 +15,7 @@ def create_token(user):
     payload = {
         "user_id": user.id,
         "role": user.role,
-        "exp": datetime.utcnow() + timedelta(hours=2)
+        "exp": datetime.utcnow() + timedelta(days=2)
     }
     token = jwt.encode(payload, current_app.config["SECRET_KEY"], algorithm="HS256")
     return token
@@ -117,6 +117,26 @@ def student_dashboard():
     db.close()
     return jsonify(result)
 
+@api.route("/student/stocks")
+@token_required(role="student")
+def get_student_stocks():
+    db = SessionLocal()
+    user = db.query(User).get(g.current_user.id)
+    stocks = db.query(StudentStock).filter_by(student_id=user.id).all()
+    result = []
+    for s in stocks:
+        stock = db.query(Stock).get(s.stock_id)
+        if stock:
+            result.append({
+                "id": stock.id,
+                "symbol": stock.symbol,
+                "name": stock.name,
+                "current_price": stock.current_price,
+                "quantity": s.quantity
+            })
+    db.close()
+    return jsonify(result)
+
 @api.route("/stocks/all")
 @token_required(role="student")
 def get_all_stocks():
@@ -132,12 +152,22 @@ def get_all_stocks():
 def get_stock(stock_id):
     db = SessionLocal()
     stock = db.query(Stock).get(stock_id)
+    user = db.query(User).get(g.current_user.id)
+    holding = next((h for h in user.holdings if h.stock_id == stock_id), None)
+    shares = holding.quantity if holding else 0
     db.close()
     if not stock:
         return jsonify({"error": "Stock not found"}), 404
+    history = db.query(StockPriceHistory).filter_by(stock_id=stock_id).order_by(StockPriceHistory.timestamp.asc()).all()
     return jsonify({
-        "id": stock.id, "symbol": stock.symbol, "name": stock.name, "current_price": stock.current_price
+        "id": stock.id,
+        "symbol": stock.symbol,
+        "name": stock.name,
+        "current_price": stock.current_price,
+        "shares": shares,
+        "history": [{"timestamp": h.timestamp.strftime("%Y-%m-%d %H:%M"), "value": h.price} for h in history]
     })
+
 
 @api.route("/stocks/<int:stock_id>/buy", methods=["POST"])
 @token_required(role="student")
@@ -274,6 +304,77 @@ def add_student():
     db.close()
     return jsonify({"success": f"Student {username} added"})
 
+@api.route("/teacher/student/<int:student_id>/change-password", methods=["POST"])
+@token_required(role="teacher")
+def teacher_change_student_password(student_id):
+    data = request.get_json() or {}
+    new_password = data.get("new_password")
+    if not new_password:
+        return jsonify({"error": "Missing new password"}), 400
+
+    db = SessionLocal()
+    student = db.query(User).filter_by(id=student_id, role="student",
+                                       teacher_id=g.current_user.id).first()
+    if not student:
+        db.close()
+        return jsonify({"error": "Student not found"}), 404
+
+    student.password = new_password
+    db.commit()
+    db.close()
+    return jsonify({"success": f"Password updated for student {student.username}"})
+
+@api.route("/teacher/student/<int:student_id>/add-funds", methods=["POST"])
+@token_required(role="teacher")
+def teacher_add_funds_to_student(student_id):
+    data = request.get_json() or {}
+    amount = float(data.get("amount", 0))
+    if amount <= 0:
+        return jsonify({"error": "Amount must be greater than 0"}), 400
+
+    db = SessionLocal()
+    student = db.query(User).filter_by(id=student_id, role="student", teacher_id=g.current_user.id).first()
+    if not student:
+        db.close()
+        return jsonify({"error": "Student not found"}), 404
+
+    student.funds += amount
+    db.commit()
+    student_name = student.username  # access while session is still open
+    db.close()
+    return jsonify({"success": f"Added {amount:.2f} to student {student_name}"})
+
+
+@api.route("/teacher/students", methods=["GET"])
+@token_required(role="teacher")
+def teacher_get_students():
+    db = SessionLocal()
+    students = db.query(User).filter_by(role="student", teacher_id=g.current_user.id).all()
+    results = []
+    for student in students:
+        results.append({
+            "student_id": student.id,
+            "student_username": student.username,
+            "student_password": student.password,
+            "student_funds": student.funds
+        })
+    db.close()
+    return jsonify(results)
+
+@api.route("/teacher/delete-student/<int:student_id>", methods=["POST"])
+@token_required(role="teacher")
+def teacher_delete_student(student_id):
+    db = SessionLocal()
+    student = db.query(User).filter_by(id=student_id, role="student", teacher_id=g.current_user.id).first()
+    if not student:
+        db.close()
+        return jsonify({"error": "Student not found"}), 404
+
+    db.delete(student)
+    db.commit()
+    db.close()
+    return jsonify({"success": f"Deleted student {student.username}"})
+
 
 # --- Teacher: Get student's portfolio ---
 @api.route("/teacher/student-portfolio/<int:student_id>")
@@ -297,5 +398,40 @@ def teacher_student_portfolio(student_id):
             "total_value": round(h.quantity * stock.current_price, 2),
             "total_paid": round(total_paid, 2)
         })
+
+    trades = db.query(Trade).filter_by(student_id=student_id).order_by(Trade.timestamp.asc()).all()
+    stock_ids = sorted({t.stock_id for t in trades})
+    histories = {}
+    all_timestamps = set()
+    for sid in stock_ids:
+        hist = db.query(StockPriceHistory).filter_by(stock_id=sid).order_by(StockPriceHistory.timestamp.asc()).all()
+        histories[sid] = hist
+        for h in hist:
+            all_timestamps.add(h.timestamp)
+    for t in trades:
+        all_timestamps.add(t.timestamp)
+    sorted_ts = sorted(all_timestamps)
+
+    from collections import defaultdict
+    holding = defaultdict(int)
+    trade_idx = 0
+    price_ptr = {sid: 0 for sid in stock_ids}
+    current_price = {sid: (histories[sid][0].price if histories[sid] else 0) for sid in stock_ids}
+
+    results = []
+    for ts in sorted_ts:
+        for sid in stock_ids:
+            hist = histories[sid]
+            ptr = price_ptr[sid]
+            while ptr < len(hist) and hist[ptr].timestamp <= ts:
+                current_price[sid] = hist[ptr].price
+                ptr += 1
+            price_ptr[sid] = ptr
+        while trade_idx < len(trades) and trades[trade_idx].timestamp <= ts:
+            tr = trades[trade_idx]
+            holding[tr.stock_id] += tr.quantity if tr.trade_type == "buy" else -tr.quantity
+            trade_idx += 1
+        total_value = sum(holding[sid] * current_price[sid] for sid in holding if holding[sid] > 0)
+        results.append({"timestamp": ts.strftime("%Y-%m-%d %H:%M"), "value": round(total_value, 2)})
     db.close()
-    return jsonify({"portfolio": portfolio})
+    return jsonify({"portfolio": portfolio, "portfolio_performance": results})
